@@ -22,7 +22,7 @@ class CKDataset(Dataset):
                 label = int(row[0])
                 pixels = np.array(row[1].split(), dtype=np.uint8).reshape(48, 48)
                 usage = row[2].strip()
-                if usage == split:
+                if usage == split and label <= 6:
                     self.images.append(pixels)
                     self.labels.append(label)
 
