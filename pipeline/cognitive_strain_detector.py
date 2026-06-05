@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
+from mygaze_hook import MyGazeHook
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'model'))
 from model import FERModel
@@ -247,32 +248,6 @@ class CognitiveStrainDetector:
         }.get(metrics['strain_label'], (200, 200, 200))
 
         put(f"Strain  : {metrics['strain_label']} ({metrics['strain_score']:.2f})", strain_color)
-
-
-# ── MyGaze SDK hook ───────────────────────────────────────────────────────────
-# Replace the stub below with the real MyGaze SDK calls once the hardware is
-# connected.  The `GazePoint` returned should have .x and .y in screen coords.
-
-class MyGazeHook:
-    """Stub — swap in real MyGaze SDK when hardware is available."""
-    def __init__(self):
-        self._connected = False
-
-    def connect(self):
-        # from mygaze import MyGaze; self._sdk = MyGaze(); self._sdk.start()
-        print("[MyGaze] Using stub — hardware not connected")
-        self._connected = False
-
-    def get_gaze_point(self):
-        # return self._sdk.get_latest_gaze_point()
-        return None  # (x, y) in screen pixels when connected
-
-    def disconnect(self):
-        if self._connected:
-            pass  # self._sdk.stop()
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     detector_system = CognitiveStrainDetector()
