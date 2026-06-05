@@ -36,13 +36,18 @@ EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 STRAIN_EMOTIONS = {'Fear', 'Sad', 'Angry', 'Disgust'}
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
-EAR_BLINK_THRESHOLD = 0.21   # Eye Aspect Ratio below this = blink
-EAR_CONSEC_FRAMES = 2        # frames below threshold to count as a blink
+EAR_BLINK_THRESHOLD = 0.21   # fallback only — overridden by personal calibration
+EAR_BLINK_RATIO    = 0.72    # blink threshold = open-eye EAR × this ratio
+EAR_PERCLOS_RATIO  = 0.80    # PERCLOS closure threshold = open-eye EAR × this ratio
+EAR_CONSEC_FRAMES  = 1       # frames below threshold to register a blink
+PERCLOS_WINDOW     = 900     # rolling frame window for PERCLOS (~30 s at 30 fps)
+PERCLOS_THRESHOLD  = 0.15    # PERCLOS fraction above this = strain indicator
 BLINK_WINDOW_SECS = 30       # rolling window for blink-rate measurement
 HIGH_BLINK_RATE = 25         # blinks/min above this = strain indicator
 GAZE_INSTABILITY_THRESHOLD = 15  # px jitter over window = strain indicator
 STRAIN_EMOTION_RATIO = 0.4   # fraction of recent frames with strain emotion
-CALIBRATION_SECS = 20        # duration of startup blink-rate calibration
+CALIBRATION_SECS  = 20       # total calibration duration
+BASELINE_SECS     = 3        # first N seconds: eyes-open EAR measurement
 
 # ── CNN transform ─────────────────────────────────────────────────────────────
 cnn_transform = transforms.Compose([
@@ -115,15 +120,18 @@ class CognitiveStrainDetector:
             min_detection_confidence=0.5, min_tracking_confidence=0.5,
         )
 
-        # Calibration baseline (overwritten by calibrate())
+        # Calibration baselines (overwritten by calibrate())
         self.baseline_blink_rate = HIGH_BLINK_RATE
+        self.ear_threshold = EAR_BLINK_THRESHOLD
+        self.perclos_threshold = EAR_BLINK_THRESHOLD / EAR_BLINK_RATIO * EAR_PERCLOS_RATIO
 
         # Rolling state
         self.blink_consec = 0
-        self.blink_times = collections.deque()         # timestamps of blinks
+        self.blink_times = collections.deque()
         self.gaze_history = collections.deque(maxlen=30)
         self.emotion_history = collections.deque(maxlen=60)
         self.iris_diameter_history = collections.deque(maxlen=60)
+        self.ear_history = collections.deque(maxlen=PERCLOS_WINDOW)
         self.no_face_frames = 0
 
         # CSV log — opened by start_recording() once the user starts the session
@@ -172,7 +180,8 @@ class CognitiveStrainDetector:
             ear = (_ear(left_pts) + _ear(right_pts)) / 2.0
             metrics['ear'] = ear
 
-            if ear < EAR_BLINK_THRESHOLD:
+            self.ear_history.append(ear)
+            if ear < self.ear_threshold:
                 self.blink_consec += 1
             else:
                 if self.blink_consec >= EAR_CONSEC_FRAMES:
@@ -239,6 +248,7 @@ class CognitiveStrainDetector:
         # ── Strain score ──────────────────────────────────────────────────────
         metrics['blink_rate'] = self._blink_rate()
         metrics['gaze_jitter'] = self._gaze_jitter()
+        metrics['perclos'] = self._perclos()
         metrics['strain_score'], metrics['strain_label'] = self._strain_score(metrics)
 
         # ── Log to CSV (only while recording and face is visible) ─────────────
@@ -253,6 +263,7 @@ class CognitiveStrainDetector:
                 round(metrics['gaze_jitter'], 2),
                 metrics['gaze_direction'] or '',
                 round(metrics['iris_diameter'], 2) if metrics['iris_diameter'] is not None else '',
+                round(metrics['perclos'], 4),
             ])
 
         # ── Annotate frame ────────────────────────────────────────────────────
@@ -262,29 +273,83 @@ class CognitiveStrainDetector:
     # ── Calibration ───────────────────────────────────────────────────────────
 
     def calibrate(self, cap, duration=CALIBRATION_SECS):
-        """Wait for SPACE, then run a timed blink-collection phase to set a personal baseline."""
+        """Two-phase calibration:
+        Phase A — measure open-eye EAR to set a personal blink threshold.
+        Phase B — count blinks with that threshold to set a personal blink-rate baseline.
+        """
         if not _wait_for_key(cap, 'Step 1 of 2: Calibration',
-                             f'Sit naturally and blink normally for {duration}s'):
+                             f'Keep eyes open for {BASELINE_SECS}s, then blink normally'):
             return
-        print(f"Calibrating for {duration}s — look naturally at the screen...")
-        end_time = time.time() + duration
-        cal_blinks = 0
-        cal_consec = 0
 
-        while time.time() < end_time:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # ── Phase A: open-eye EAR baseline ───────────────────────────────────
+        print(f"Phase A: measuring open-eye EAR for {BASELINE_SECS}s — keep eyes open...")
+        open_ears = []
+        end_a = time.time() + BASELINE_SECS
+
+        while time.time() < end_a:
             ret, frame = cap.read()
             if not ret:
                 break
+            remaining = max(0, int(end_a - time.time()) + 1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            current_ear = None
 
-            remaining = max(0, int(end_time - time.time()) + 1)
+            for face in self.detector(gray, 0):
+                landmarks = self.predictor(gray, face)
+                left_pts  = _eye_pts(landmarks, 36, 42)
+                right_pts = _eye_pts(landmarks, 42, 48)
+                ear = (_ear(left_pts) + _ear(right_pts)) / 2.0
+                open_ears.append(ear)
+                current_ear = ear
+                break
+
+            w = frame.shape[1]
+            cv2.rectangle(frame, (0, 0), (w, 80), (0, 60, 0), -1)
+            cv2.putText(frame, 'PHASE 1 — Keep your eyes open naturally',
+                        (10, 28), font, 0.65, (0, 255, 150), 2)
+            ear_txt = f'EAR: {current_ear:.3f}' if current_ear else 'No face detected'
+            cv2.putText(frame,
+                        f'Time remaining: {remaining}s    {ear_txt}    Samples: {len(open_ears)}',
+                        (10, 60), font, 0.52, (200, 200, 200), 1)
+            cv2.imshow('Cognitive Strain Detector', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                return
+
+        # Derive personal threshold from the 80th-percentile open-eye EAR
+        if len(open_ears) >= 5:
+            open_eye_ear = float(np.percentile(open_ears, 80))
+            self.ear_threshold    = open_eye_ear * EAR_BLINK_RATIO
+            self.perclos_threshold = open_eye_ear * EAR_PERCLOS_RATIO
+        else:
+            open_eye_ear = EAR_BLINK_THRESHOLD / EAR_BLINK_RATIO
+            self.ear_threshold    = EAR_BLINK_THRESHOLD
+            self.perclos_threshold = open_eye_ear * EAR_PERCLOS_RATIO
+        print(f"Open-eye EAR: {open_eye_ear:.3f}  →  "
+              f"blink thr: {self.ear_threshold:.3f}  "
+              f"PERCLOS thr: {self.perclos_threshold:.3f}")
+
+        # ── Phase B: blink counting ───────────────────────────────────────────
+        blink_secs = duration - BASELINE_SECS
+        print(f"Phase B: counting blinks for {blink_secs}s — blink normally...")
+        cal_blinks = 0
+        cal_consec = 0
+        end_b = time.time() + blink_secs
+
+        while time.time() < end_b:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            remaining = max(0, int(end_b - time.time()) + 1)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             for face in self.detector(gray, 0):
                 landmarks = self.predictor(gray, face)
-                left_pts = _eye_pts(landmarks, 36, 42)
+                left_pts  = _eye_pts(landmarks, 36, 42)
                 right_pts = _eye_pts(landmarks, 42, 48)
                 ear = (_ear(left_pts) + _ear(right_pts)) / 2.0
-                if ear < EAR_BLINK_THRESHOLD:
+                if ear < self.ear_threshold:
                     cal_consec += 1
                 else:
                     if cal_consec >= EAR_CONSEC_FRAMES:
@@ -292,18 +357,23 @@ class CognitiveStrainDetector:
                     cal_consec = 0
                 break
 
-            # Overlay
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 75), (0, 0, 0), -1)
-            cv2.putText(frame, 'CALIBRATING — look naturally at the screen',
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-            cv2.putText(frame, f'Time remaining: {remaining}s    Blinks detected: {cal_blinks}',
-                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            h, w = frame.shape[:2]
+            cv2.rectangle(frame, (0, 0), (w, 80), (0, 0, 0), -1)
+            cv2.putText(frame, 'PHASE 2 — Blink normally',
+                        (10, 28), font, 0.65, (0, 255, 255), 2)
+            cv2.putText(frame,
+                        f'Time remaining: {remaining}s    '
+                        f'Blinks: {cal_blinks}    '
+                        f'Threshold EAR: {self.ear_threshold:.3f}',
+                        (10, 60), font, 0.52, (200, 200, 200), 1)
             cv2.imshow('Cognitive Strain Detector', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        self.baseline_blink_rate = max(cal_blinks * (60.0 / duration), 8.0)
-        print(f"Calibration done. Baseline: {self.baseline_blink_rate:.1f} blinks/min")
+        self.baseline_blink_rate = max(cal_blinks * (60.0 / blink_secs), 8.0)
+        print(f"Calibration done. "
+              f"Blink threshold: {self.ear_threshold:.3f}  "
+              f"Baseline rate: {self.baseline_blink_rate:.1f} blinks/min")
         return self.baseline_blink_rate
 
     def start_recording(self):
@@ -317,7 +387,7 @@ class CognitiveStrainDetector:
         self._csv.writerow([
             'timestamp', 'strain_score', 'strain_label',
             'emotion', 'blink_rate', 'ear',
-            'gaze_jitter', 'gaze_direction', 'iris_diameter',
+            'gaze_jitter', 'gaze_direction', 'iris_diameter', 'perclos',
         ])
         print(f"Recording to {log_path}")
 
@@ -337,6 +407,13 @@ class CognitiveStrainDetector:
             return 0.0
         pts = np.array(self.gaze_history)
         return float(np.std(pts, axis=0).mean())
+
+    def _perclos(self):
+        """Fraction of recent frames where EAR < perclos_threshold (eye ≥ 80 % closed)."""
+        if len(self.ear_history) < 30:
+            return 0.0
+        arr = np.array(self.ear_history)
+        return float(np.mean(arr < self.perclos_threshold))
 
     def _emotion_strain_ratio(self):
         if not self.emotion_history:
@@ -367,6 +444,10 @@ class CognitiveStrainDetector:
         if er > STRAIN_EMOTION_RATIO:
             score += 0.34
             reasons.append('strain emotion')
+
+        if metrics.get('perclos', 0.0) > PERCLOS_THRESHOLD:
+            score += 0.25
+            reasons.append('sustained eye closure')
 
         if (metrics.get('iris_diameter') is not None
                 and len(self.iris_diameter_history) >= 10):
@@ -411,6 +492,7 @@ class CognitiveStrainDetector:
             put(f"EAR     : {metrics['ear']:.3f}")
 
         put(f"Blinks/m: {metrics['blink_rate']:.1f}")
+        put(f"PERCLOS : {metrics['perclos']*100:.1f}%")
         put(f"Gaze jit: {metrics['gaze_jitter']:.1f}px")
         put(f"Gaze    : {metrics['gaze_direction'] or '—'}")
 

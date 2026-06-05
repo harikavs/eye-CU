@@ -101,16 +101,31 @@ def _panel_jitter(ax, df):
 
 
 def _panel_ear(ax, df):
-    t   = df['t']
-    ear = df['ear']
+    t      = df['t']
+    ear    = df['ear']
     labels = df['strain_label'].fillna('LOW STRAIN')
     _shade(ax, t, labels)
     ax.plot(t, ear,          color='#80CBC4', lw=0.5, alpha=0.6)
-    ax.plot(t, _smooth(ear), color='#00695C', lw=1.6)
-    ax.axhline(0.21, color='#00ACC1', lw=0.9, ls='--', alpha=0.85, label='blink thr. (0.21)')
+    ax.plot(t, _smooth(ear), color='#00695C', lw=1.6, label='EAR')
     ax.set_ylabel('EAR', fontsize=8)
-    ax.set_title('Eye Aspect Ratio', fontsize=9)
-    ax.legend(fontsize=6.5, frameon=False)
+    ax.set_title('Eye Openness & PERCLOS', fontsize=9)
+
+    # PERCLOS on a secondary y-axis (0–100 %)
+    if 'perclos' in df.columns:
+        ax2 = ax.twinx()
+        p   = df['perclos'] * 100          # → percentage
+        ax2.plot(t, p,           color='#EF9A9A', lw=0.5, alpha=0.5)
+        ax2.plot(t, _smooth(p),  color='#C62828', lw=1.4, ls='--', label='PERCLOS')
+        ax2.axhline(15, color='#C62828', lw=0.8, ls=':', alpha=0.7, label='thr. 15 %')
+        ax2.set_ylabel('PERCLOS (%)', fontsize=7, color='#C62828')
+        ax2.tick_params(axis='y', labelcolor='#C62828', labelsize=6.5)
+        ax2.set_ylim(0, 100)
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6.5, frameon=False)
+    else:
+        ax.legend(fontsize=6.5, frameon=False)
+
     _time_axis(ax, t)
 
 
@@ -186,6 +201,7 @@ def _print_summary(df, path):
     ear       = df['ear'].dropna()
     jit       = df['gaze_jitter']
     iris      = df['iris_diameter'].dropna()
+    perclos   = df['perclos'].dropna() if 'perclos' in df.columns else pd.Series(dtype=float)
     gaze_pct  = df['gaze_direction'].replace('', pd.NA).dropna().value_counts(normalize=True) * 100
     emo       = df['emotion'].replace('', pd.NA).dropna().value_counts()
     dom_emo   = emo.index[0] if not emo.empty else '—'
@@ -219,6 +235,12 @@ def _print_summary(df, path):
     print('  EAR  (Eye Aspect Ratio)')
     row('Mean / Std',  f'{ear.mean():.3f} / {ear.std():.3f}')
     print()
+    if not perclos.empty:
+        pct_high = (perclos > 0.15).mean() * 100
+        print('  PERCLOS  (% of time eye ≥ 80 % closed, 30 s window)')
+        row('Mean / Peak',  f'{perclos.mean()*100:.1f} % / {perclos.max()*100:.1f} %')
+        row('Time above 15 %', f'{pct_high:.1f} % of session')
+        print()
     print('  GAZE JITTER  (px)')
     row('Mean / Peak',  f'{jit.mean():.1f} / {jit.max():.1f}')
     print()
