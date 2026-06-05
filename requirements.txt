@@ -4,6 +4,7 @@ opencv-contrib-python==4.13.0.92
 dlib-bin==20.0.1
 mediapipe==0.10.14
 numpy==2.4.6
+pandas
 scikit-learn==1.5.2
 pillow==12.2.0
 matplotlib==3.10.9
