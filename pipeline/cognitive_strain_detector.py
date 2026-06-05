@@ -72,6 +72,34 @@ def _gaze_center(landmarks):
     return (left + right) / 2.0
 
 
+def _wait_for_key(cap, title, subtitle='', key=32):
+    """Overlay a prompt on the live feed and block until SPACE (or Q to abort).
+    Returns True when the user continues, False if they quit."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            return False
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, h // 2 - 80), (w, h // 2 + 85), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        for text, y, scale, color, thick in [
+            (title,                         h // 2 - 30, 0.75, (255, 255, 255), 2),
+            (subtitle,                      h // 2 + 12, 0.55, (180, 180, 180), 1),
+            ('SPACE to continue  |  Q to quit', h // 2 + 58, 0.48, (100, 210, 100), 1),
+        ]:
+            if text:
+                (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+                cv2.putText(frame, text, ((w - tw) // 2, y), font, scale, color, thick)
+        cv2.imshow('Cognitive Strain Detector', frame)
+        k = cv2.waitKey(1) & 0xFF
+        if k == 32:
+            return True
+        if k == ord('q'):
+            return False
+
+
 class CognitiveStrainDetector:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -96,20 +124,11 @@ class CognitiveStrainDetector:
         self.gaze_history = collections.deque(maxlen=30)
         self.emotion_history = collections.deque(maxlen=60)
         self.iris_diameter_history = collections.deque(maxlen=60)
+        self.no_face_frames = 0
 
-        # Session CSV log
-        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        session_ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        log_path = os.path.join(log_dir, f'session_{session_ts}.csv')
-        self._csv_file = open(log_path, 'w', newline='', buffering=1)
-        self._csv = csv.writer(self._csv_file)
-        self._csv.writerow([
-            'timestamp', 'strain_score', 'strain_label',
-            'emotion', 'blink_rate', 'ear',
-            'gaze_jitter', 'gaze_direction', 'iris_diameter',
-        ])
-        print(f"Logging session to {log_path}")
+        # CSV log — opened by start_recording() once the user starts the session
+        self._csv_file = None
+        self._csv = None
 
     # ── Inference helpers ──────────────────────────────────────────────────────
 
@@ -213,23 +232,28 @@ class CognitiveStrainDetector:
         elif dlib_gaze is not None:
             self.gaze_history.append(dlib_gaze)
 
+        # ── Face-presence tracking ────────────────────────────────────────────
+        face_found = bool(faces) or (mp_result.multi_face_landmarks is not None)
+        self.no_face_frames = 0 if face_found else self.no_face_frames + 1
+
         # ── Strain score ──────────────────────────────────────────────────────
         metrics['blink_rate'] = self._blink_rate()
         metrics['gaze_jitter'] = self._gaze_jitter()
         metrics['strain_score'], metrics['strain_label'] = self._strain_score(metrics)
 
-        # ── Log to CSV ────────────────────────────────────────────────────────
-        self._csv.writerow([
-            round(time.time(), 3),
-            metrics['strain_score'],
-            metrics['strain_label'],
-            metrics['emotion'] or '',
-            round(metrics['blink_rate'], 2),
-            round(metrics['ear'], 3) if metrics['ear'] is not None else '',
-            round(metrics['gaze_jitter'], 2),
-            metrics['gaze_direction'] or '',
-            round(metrics['iris_diameter'], 2) if metrics['iris_diameter'] is not None else '',
-        ])
+        # ── Log to CSV (only while recording and face is visible) ─────────────
+        if self._csv is not None and face_found:
+            self._csv.writerow([
+                round(time.time(), 3),
+                metrics['strain_score'],
+                metrics['strain_label'],
+                metrics['emotion'] or '',
+                round(metrics['blink_rate'], 2),
+                round(metrics['ear'], 3) if metrics['ear'] is not None else '',
+                round(metrics['gaze_jitter'], 2),
+                metrics['gaze_direction'] or '',
+                round(metrics['iris_diameter'], 2) if metrics['iris_diameter'] is not None else '',
+            ])
 
         # ── Annotate frame ────────────────────────────────────────────────────
         self._draw(frame, metrics, faces)
@@ -238,7 +262,10 @@ class CognitiveStrainDetector:
     # ── Calibration ───────────────────────────────────────────────────────────
 
     def calibrate(self, cap, duration=CALIBRATION_SECS):
-        """Run a timed blink-collection phase to set a personal blink-rate baseline."""
+        """Wait for SPACE, then run a timed blink-collection phase to set a personal baseline."""
+        if not _wait_for_key(cap, 'Step 1 of 2: Calibration',
+                             f'Sit naturally and blink normally for {duration}s'):
+            return
         print(f"Calibrating for {duration}s — look naturally at the screen...")
         end_time = time.time() + duration
         cal_blinks = 0
@@ -279,8 +306,24 @@ class CognitiveStrainDetector:
         print(f"Calibration done. Baseline: {self.baseline_blink_rate:.1f} blinks/min")
         return self.baseline_blink_rate
 
+    def start_recording(self):
+        """Open the session CSV. Call this only when the user commits to recording."""
+        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        session_ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        log_path = os.path.join(log_dir, f'session_{session_ts}.csv')
+        self._csv_file = open(log_path, 'w', newline='', buffering=1)
+        self._csv = csv.writer(self._csv_file)
+        self._csv.writerow([
+            'timestamp', 'strain_score', 'strain_label',
+            'emotion', 'blink_rate', 'ear',
+            'gaze_jitter', 'gaze_direction', 'iris_diameter',
+        ])
+        print(f"Recording to {log_path}")
+
     def close(self):
-        self._csv_file.close()
+        if self._csv_file is not None:
+            self._csv_file.close()
         self.face_mesh.close()
 
     # ── Strain scoring ─────────────────────────────────────────────────────────
@@ -383,6 +426,30 @@ class CognitiveStrainDetector:
 
         put(f"Strain  : {metrics['strain_label']} ({metrics['strain_score']:.2f})", strain_color)
 
+        # ── Face-not-detected warning ─────────────────────────────────────────
+        nf = self.no_face_frames
+        if nf >= 90:
+            # Prominent red tint + centred message (face gone ~3 s+)
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 160), -1)
+            cv2.addWeighted(overlay, 0.28, frame, 0.72, 0, frame)
+            secs = nf // 30
+            for text, fy, scale, color, thick in [
+                ('FACE NOT DETECTED',               h // 2 - 20, 1.1,  (255, 255, 255), 3),
+                ('Please look at the camera',       h // 2 + 28, 0.65, (220, 220, 220), 1),
+                (f'({secs}s without detection)',     h // 2 + 60, 0.52, (180, 180, 180), 1),
+            ]:
+                (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+                cv2.putText(frame, text, ((w - tw) // 2, fy),
+                            cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
+        elif nf >= 30:
+            # Subtle amber strip at the bottom (~1–3 s)
+            cv2.rectangle(frame, (0, h - 36), (w, h), (0, 140, 220), -1)
+            msg = 'Face not visible — please look at the camera'
+            (tw, _), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.putText(frame, msg, ((w - tw) // 2, h - 11),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
 
 def main():
     detector_system = CognitiveStrainDetector()
@@ -399,7 +466,13 @@ def main():
     try:
         detector_system.calibrate(cap)
 
-        print("Running — press Q to quit")
+        if not _wait_for_key(cap, 'Step 2 of 2: Recording',
+                             'Session data will be saved when you press SPACE'):
+            return
+
+        detector_system.start_recording()
+        print("Recording — press Q to quit")
+
         while True:
             ret, frame = cap.read()
             if not ret:
