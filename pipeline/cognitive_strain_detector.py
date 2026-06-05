@@ -8,6 +8,8 @@ Combines:
 Uses dlib 68-landmark face detection.
 """
 
+import csv
+import datetime
 import sys
 import os
 import time
@@ -40,6 +42,7 @@ BLINK_WINDOW_SECS = 30       # rolling window for blink-rate measurement
 HIGH_BLINK_RATE = 25         # blinks/min above this = strain indicator
 GAZE_INSTABILITY_THRESHOLD = 15  # px jitter over window = strain indicator
 STRAIN_EMOTION_RATIO = 0.4   # fraction of recent frames with strain emotion
+CALIBRATION_SECS = 20        # duration of startup blink-rate calibration
 
 # ── CNN transform ─────────────────────────────────────────────────────────────
 cnn_transform = transforms.Compose([
@@ -84,12 +87,29 @@ class CognitiveStrainDetector:
             min_detection_confidence=0.5, min_tracking_confidence=0.5,
         )
 
+        # Calibration baseline (overwritten by calibrate())
+        self.baseline_blink_rate = HIGH_BLINK_RATE
+
         # Rolling state
         self.blink_consec = 0
         self.blink_times = collections.deque()         # timestamps of blinks
         self.gaze_history = collections.deque(maxlen=30)
         self.emotion_history = collections.deque(maxlen=60)
         self.iris_diameter_history = collections.deque(maxlen=60)
+
+        # Session CSV log
+        log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        session_ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        log_path = os.path.join(log_dir, f'session_{session_ts}.csv')
+        self._csv_file = open(log_path, 'w', newline='', buffering=1)
+        self._csv = csv.writer(self._csv_file)
+        self._csv.writerow([
+            'timestamp', 'strain_score', 'strain_label',
+            'emotion', 'blink_rate', 'ear',
+            'gaze_jitter', 'gaze_direction', 'iris_diameter',
+        ])
+        print(f"Logging session to {log_path}")
 
     # ── Inference helpers ──────────────────────────────────────────────────────
 
@@ -198,9 +218,70 @@ class CognitiveStrainDetector:
         metrics['gaze_jitter'] = self._gaze_jitter()
         metrics['strain_score'], metrics['strain_label'] = self._strain_score(metrics)
 
+        # ── Log to CSV ────────────────────────────────────────────────────────
+        self._csv.writerow([
+            round(time.time(), 3),
+            metrics['strain_score'],
+            metrics['strain_label'],
+            metrics['emotion'] or '',
+            round(metrics['blink_rate'], 2),
+            round(metrics['ear'], 3) if metrics['ear'] is not None else '',
+            round(metrics['gaze_jitter'], 2),
+            metrics['gaze_direction'] or '',
+            round(metrics['iris_diameter'], 2) if metrics['iris_diameter'] is not None else '',
+        ])
+
         # ── Annotate frame ────────────────────────────────────────────────────
         self._draw(frame, metrics, faces)
         return frame, metrics
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+
+    def calibrate(self, cap, duration=CALIBRATION_SECS):
+        """Run a timed blink-collection phase to set a personal blink-rate baseline."""
+        print(f"Calibrating for {duration}s — look naturally at the screen...")
+        end_time = time.time() + duration
+        cal_blinks = 0
+        cal_consec = 0
+
+        while time.time() < end_time:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            remaining = max(0, int(end_time - time.time()) + 1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            for face in self.detector(gray, 0):
+                landmarks = self.predictor(gray, face)
+                left_pts = _eye_pts(landmarks, 36, 42)
+                right_pts = _eye_pts(landmarks, 42, 48)
+                ear = (_ear(left_pts) + _ear(right_pts)) / 2.0
+                if ear < EAR_BLINK_THRESHOLD:
+                    cal_consec += 1
+                else:
+                    if cal_consec >= EAR_CONSEC_FRAMES:
+                        cal_blinks += 1
+                    cal_consec = 0
+                break
+
+            # Overlay
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 75), (0, 0, 0), -1)
+            cv2.putText(frame, 'CALIBRATING — look naturally at the screen',
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            cv2.putText(frame, f'Time remaining: {remaining}s    Blinks detected: {cal_blinks}',
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            cv2.imshow('Cognitive Strain Detector', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        self.baseline_blink_rate = max(cal_blinks * (60.0 / duration), 8.0)
+        print(f"Calibration done. Baseline: {self.baseline_blink_rate:.1f} blinks/min")
+        return self.baseline_blink_rate
+
+    def close(self):
+        self._csv_file.close()
+        self.face_mesh.close()
 
     # ── Strain scoring ─────────────────────────────────────────────────────────
 
@@ -226,10 +307,12 @@ class CognitiveStrainDetector:
         reasons = []
 
         br = metrics['blink_rate']
-        if br > HIGH_BLINK_RATE:
+        high_thresh = max(self.baseline_blink_rate * 1.5, self.baseline_blink_rate + 8)
+        low_thresh = max(self.baseline_blink_rate * 0.5, 4.0)
+        if br > high_thresh:
             score += 0.33
             reasons.append('high blink rate')
-        elif br < 8:                      # very low blink rate = focused/strained
+        elif br < low_thresh:
             score += 0.2
             reasons.append('low blink rate')
 
@@ -307,25 +390,30 @@ def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: cannot open webcam")
+        detector_system.close()
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    print("Running — press Q to quit")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        detector_system.calibrate(cap)
 
-        annotated, metrics = detector_system.process_frame(frame)
+        print("Running — press Q to quit")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        cv2.imshow('Cognitive Strain Detector', annotated)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            annotated, _ = detector_system.process_frame(frame)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow('Cognitive Strain Detector', annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        detector_system.close()
 
 
 if __name__ == '__main__':

@@ -1,4 +1,31 @@
+# ── Virtual environment ───────────────────────────────────────────────────────
 venv/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Training datasets ─────────────────────────────────────────────────────────
+# Excluded from repo (too large). Download FER2013 / CK+ separately if retraining.
+data/
+
+# ── Redundant model checkpoint ───────────────────────────────────────────────
+# The pipeline loads fer_model.pth; fer_model_best.pth is a training-time artefact.
+results/fer_model_best.pth
+
+# ── Runtime session logs ──────────────────────────────────────────────────────
+logs/
