@@ -3,10 +3,9 @@ Real-time cognitive strain detector.
 
 Combines:
   - Facial expression recognition (FERModel CNN)
-  - Eye-tracking metrics (blink rate, fixation stability, pupil area proxy)
+  - Eye-tracking metrics (blink rate, fixation stability)
 
-Uses dlib 68-landmark face detection.  A MyGaze SDK hook is provided
-at the bottom — swap in the real API when the hardware is connected.
+Uses dlib 68-landmark face detection.
 """
 
 import sys
@@ -15,11 +14,11 @@ import time
 import collections
 import cv2
 import dlib
+import mediapipe as mp
 import numpy as np
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
-from mygaze_hook import MyGazeHook
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'model'))
 from model import FERModel
@@ -80,11 +79,17 @@ class CognitiveStrainDetector:
         self.detector = dlib.get_frontal_face_detector()
         self.predictor = dlib.shape_predictor(PREDICTOR_PATH)
 
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            refine_landmarks=True, max_num_faces=1,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
+
         # Rolling state
         self.blink_consec = 0
         self.blink_times = collections.deque()         # timestamps of blinks
         self.gaze_history = collections.deque(maxlen=30)
         self.emotion_history = collections.deque(maxlen=60)
+        self.iris_diameter_history = collections.deque(maxlen=60)
 
     # ── Inference helpers ──────────────────────────────────────────────────────
 
@@ -113,18 +118,21 @@ class CognitiveStrainDetector:
             'gaze_jitter': self._gaze_jitter(),
             'strain_score': 0.0,
             'strain_label': 'Unknown',
+            'gaze_direction': None,
+            'iris_diameter': None,
         }
+
+        dlib_gaze = None
 
         for face in faces:
             landmarks = self.predictor(gray, face)
 
-            # ── Eye tracking ──────────────────────────────────────────────────
+            # ── Eye tracking (EAR / blink) ────────────────────────────────────
             left_pts = _eye_pts(landmarks, 36, 42)
             right_pts = _eye_pts(landmarks, 42, 48)
             ear = (_ear(left_pts) + _ear(right_pts)) / 2.0
             metrics['ear'] = ear
 
-            # Blink detection
             if ear < EAR_BLINK_THRESHOLD:
                 self.blink_consec += 1
             else:
@@ -132,14 +140,11 @@ class CognitiveStrainDetector:
                     self.blink_times.append(time.time())
                 self.blink_consec = 0
 
-            # Prune old blink timestamps
             cutoff = time.time() - BLINK_WINDOW_SECS
             while self.blink_times and self.blink_times[0] < cutoff:
                 self.blink_times.popleft()
 
-            # Gaze center
-            gc = _gaze_center(landmarks)
-            self.gaze_history.append(gc)
+            dlib_gaze = _gaze_center(landmarks)
 
             # ── Emotion CNN ───────────────────────────────────────────────────
             x1, y1 = max(0, face.left()), max(0, face.top())
@@ -151,8 +156,42 @@ class CognitiveStrainDetector:
                 metrics['emotion_probs'] = probs
                 self.emotion_history.append(emotion)
 
-            # Only process first face
             break
+
+        # ── MediaPipe Iris ────────────────────────────────────────────────────
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_result = self.face_mesh.process(rgb)
+
+        if mp_result.multi_face_landmarks:
+            lm = mp_result.multi_face_landmarks[0].landmark
+
+            # Iris centers in pixels
+            left_iris_px = np.array([lm[468].x * w, lm[468].y * h])
+            right_iris_px = np.array([lm[473].x * w, lm[473].y * h])
+            self.gaze_history.append((left_iris_px + right_iris_px) / 2.0)
+
+            # Iris diameter: horizontal span of the 4 edge points per eye
+            left_edge = np.array([(lm[i].x * w, lm[i].y * h) for i in range(469, 473)])
+            right_edge = np.array([(lm[i].x * w, lm[i].y * h) for i in range(474, 478)])
+            left_diam = float(np.max(left_edge[:, 0]) - np.min(left_edge[:, 0]))
+            right_diam = float(np.max(right_edge[:, 0]) - np.min(right_edge[:, 0]))
+            iris_diameter = (left_diam + right_diam) / 2.0
+            self.iris_diameter_history.append(iris_diameter)
+            metrics['iris_diameter'] = iris_diameter
+
+            # Gaze direction: iris position ratio within each eye
+            left_ratio = (lm[468].x - lm[33].x) / max(lm[133].x - lm[33].x, 1e-6)
+            right_ratio = (lm[473].x - lm[362].x) / max(lm[263].x - lm[362].x, 1e-6)
+            avg_ratio = (left_ratio + right_ratio) / 2.0
+            if avg_ratio < 0.42:
+                metrics['gaze_direction'] = 'left'
+            elif avg_ratio > 0.58:
+                metrics['gaze_direction'] = 'right'
+            else:
+                metrics['gaze_direction'] = 'center'
+        elif dlib_gaze is not None:
+            self.gaze_history.append(dlib_gaze)
 
         # ── Strain score ──────────────────────────────────────────────────────
         metrics['blink_rate'] = self._blink_rate()
@@ -203,6 +242,13 @@ class CognitiveStrainDetector:
             score += 0.34
             reasons.append('strain emotion')
 
+        if (metrics.get('iris_diameter') is not None
+                and len(self.iris_diameter_history) >= 10):
+            rolling_mean = np.mean(self.iris_diameter_history)
+            if rolling_mean > 0 and metrics['iris_diameter'] > 1.15 * rolling_mean:
+                score += 0.2
+                reasons.append('iris dilation')
+
         score = min(score, 1.0)
 
         if score >= 0.66:
@@ -240,6 +286,11 @@ class CognitiveStrainDetector:
 
         put(f"Blinks/m: {metrics['blink_rate']:.1f}")
         put(f"Gaze jit: {metrics['gaze_jitter']:.1f}px")
+        put(f"Gaze    : {metrics['gaze_direction'] or '—'}")
+
+        iris_d = metrics['iris_diameter']
+        if iris_d is not None:
+            put(f"Iris dia: {iris_d:.1f}px")
 
         strain_color = {
             'HIGH STRAIN': (0, 0, 255),
@@ -249,10 +300,9 @@ class CognitiveStrainDetector:
 
         put(f"Strain  : {metrics['strain_label']} ({metrics['strain_score']:.2f})", strain_color)
 
+
 def main():
     detector_system = CognitiveStrainDetector()
-    mygaze = MyGazeHook()
-    mygaze.connect()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -270,17 +320,11 @@ def main():
 
         annotated, metrics = detector_system.process_frame(frame)
 
-        # Optionally overlay MyGaze gaze point
-        gaze = mygaze.get_gaze_point()
-        if gaze:
-            cv2.circle(annotated, (int(gaze[0]), int(gaze[1])), 8, (0, 255, 255), -1)
-
         cv2.imshow('Cognitive Strain Detector', annotated)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
-    mygaze.disconnect()
     cv2.destroyAllWindows()
 
 
