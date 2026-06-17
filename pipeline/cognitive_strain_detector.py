@@ -376,12 +376,12 @@ class CognitiveStrainDetector:
               f"Baseline rate: {self.baseline_blink_rate:.1f} blinks/min")
         return self.baseline_blink_rate
 
-    def start_recording(self):
+    def start_recording(self, participant_id='unknown'):
         """Open the session CSV. Call this only when the user commits to recording."""
         log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
         os.makedirs(log_dir, exist_ok=True)
         session_ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        log_path = os.path.join(log_dir, f'session_{session_ts}.csv')
+        log_path = os.path.join(log_dir, f'session_{participant_id}_{session_ts}.csv')
         self._csv_file = open(log_path, 'w', newline='', buffering=1)
         self._csv = csv.writer(self._csv_file)
         self._csv.writerow([
@@ -534,6 +534,8 @@ class CognitiveStrainDetector:
 
 
 def main():
+    participant_id = input("Enter participant ID: ").strip() or "unknown"
+
     detector_system = CognitiveStrainDetector()
 
     cap = cv2.VideoCapture(0)
@@ -552,7 +554,7 @@ def main():
                              'Session data will be saved when you press SPACE'):
             return
 
-        detector_system.start_recording()
+        detector_system.start_recording(participant_id)
         print("Recording — press Q to quit")
 
         while True:
