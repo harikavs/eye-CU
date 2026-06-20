@@ -262,10 +262,10 @@ def main():
     if len(sys.argv) > 1:
         csv_path = sys.argv[1]
     else:
-        csvs = sorted(glob.glob(os.path.join(LOGS_DIR, 'session_*.csv')))
+        csvs = glob.glob(os.path.join(LOGS_DIR, 'session_*.csv'))
         if not csvs:
             sys.exit(f'No session CSVs found in {os.path.abspath(LOGS_DIR)}')
-        csv_path = csvs[-1]
+        csv_path = max(csvs, key=os.path.getmtime)
 
     print(f'Analysing: {csv_path}')
 
